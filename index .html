@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rain Ahead</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1b1f24; --muted:#5f6b7a; --accent:#2f6fd0; --warn:#b3261e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151a; --card:#1c2128; --text:#e8ecf1; --muted:#9aa6b4; --accent:#6ea2f5; --warn:#ff8a80; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.4 system-ui,sans-serif; background:var(--bg); color:var(--text); padding:16px; max-width:560px; margin:auto; }
+  h1 { font-size:24px; margin:4px 0 12px; }
+  .card { background:var(--card); border-radius:12px; padding:12px; margin:12px 0; }
+  input[type=text] { width:100%; padding:12px; font-size:16px; border-radius:8px; border:1px solid var(--muted); background:var(--card); color:var(--text); }
+  input[type=range] { width:100%; }
+  button { width:100%; padding:14px; font-size:16px; border:0; border-radius:10px; background:var(--accent); color:#fff; margin-top:8px; }
+  button.sec { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; }
+  small, .muted { color:var(--muted); font-size:13px; }
+  #strip { display:flex; height:28px; border-radius:6px; overflow:hidden; margin:6px 0; }
+  #strip div { flex:1; }
+  .legend { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; color:var(--muted); }
+  .legend i { display:inline-block; width:10px; height:10px; margin-right:4px; }
+  #banner { display:none; background:var(--warn); color:#fff; padding:14px; border-radius:12px; font-weight:600; margin:12px 0; }
+  ul { padding-left:18px; margin:6px 0; }
+</style>
+</head>
+<body>
+<h1>🌧️ Rain Ahead</h1>
+
+<div class="card">
+  <input id="dest" type="text" placeholder="Destination: town name or lat,lon">
+  <small>For an exact place (e.g. an office), long-press it in Google Maps, copy the coordinates and paste them here.</small>
+  <p style="margin-bottom:0">Alert me <b id="leadVal">5</b> min before rain</p>
+  <input id="lead" type="range" min="3" max="15" value="5">
+  <button id="go">Start trip</button>
+  <button id="test" class="sec">Test alert (sound + voice)</button>
+</div>
+
+<div id="banner"></div>
+
+<div class="card">
+  <b id="status">Not tracking</b>
+  <div id="info" class="muted"></div>
+</div>
+
+<div class="card" id="routeCard" style="display:none">
+  <b>Route ahead</b>
+  <div id="strip"></div>
+  <div style="display:flex;justify-content:space-between" class="muted"><span>You</span><span>Destination</span></div>
+  <div class="legend">
+    <span><i style="background:#cfe8cf"></i>Dry</span><span><i style="background:#9ec9f5"></i>Light</span>
+    <span><i style="background:#3f7fd6"></i>Moderate</span><span><i style="background:#5b2a86"></i>Heavy</span>
+  </div>
+  <b style="display:block;margin-top:10px">Rain on your route</b>
+  <ul id="patches"></ul>
+</div>
+
+<p class="muted">Keep this page open with the screen on while driving (it keeps the screen awake for you). Browsers pause background tabs, so alerts may not arrive if you switch apps or lock the phone.</p>
+
+<script>
+const $ = id => document.getElementById(id);
+const LBL = ['No rain','Light rain','Moderate rain','Heavy rain'];
+const COL = ['#cfe8cf','#9ec9f5','#3f7fd6','#5b2a86'];
+const WEATHER_REFRESH_MS = 5*60*1000, LOOP_MS = 15000;
+
+let run = null;          // current trip state
+let audioCtx = null, wakeLock = null, lastPos = null, watchId = null, timer = null;
+
+$('lead').oninput = () => $('leadVal').textContent = $('lead').value;
+
+// ---------- helpers
+const lvl = mm => mm>=1.9 ? 3 : mm>=0.6 ? 2 : mm>=0.1 ? 1 : 0;   // mm per 15 min
+function hav(a,b){
+  const R=6371000, rad=x=>x*Math.PI/180;
+  const dLat=rad(b[0]-a[0]), dLon=rad(b[1]-a[1]);
+  const h=Math.sin(dLat/2)**2+Math.cos(rad(a[0]))*Math.cos(rad(b[0]))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.min(1,Math.sqrt(h)));
+}
+async function getJSON(u){ const r=await fetch(u); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+
+async function geocode(q){
+  const m=q.match(/^\s*(-?\d+(\.\d+)?)\s*,\s*(-?\d+(\.\d+)?)\s*$/);
+  if(m) return {name:q.trim(), lat:+m[1], lon:+m[3]};
+  const j=await getJSON('https://geocoding-api.open-meteo.com/v1/search?name='+encodeURIComponent(q.trim())+'&count=1&language=en&format=json');
+  if(!j.results||!j.results.length) return null;
+  const o=j.results[0];
+  return {name:[o.name,o.admin1].filter(Boolean).join(', '), lat:o.latitude, lon:o.longitude};
+}
+
+async function getRoute(a,b){
+  const j=await getJSON(`https://router.project-osrm.org/route/v1/driving/${a[1]},${a[0]};${b[1]},${b[0]}?overview=full&geometries=geojson`);
+  if(j.code!=='Ok') throw new Error('No route found');
+  const rt=j.routes[0];
+  const pts=rt.geometry.coordinates.map(c=>[c[1],c[0]]);
+  const cum=[0];
+  for(let i=1;i<pts.length;i++) cum.push(cum[i-1]+hav(pts[i-1],pts[i]));
+  return {pts, cum, total:cum[cum.length-1], dur:rt.duration};
+}
+
+function makeSamples(route){
+  const step=Math.max(3000, route.total/80), out=[]; let next=0;
+  route.pts.forEach((p,i)=>{ if(route.cum[i]>=next){ out.push({pos:p, dist:route.cum[i]}); next=route.cum[i]+step; } });
+  if(out[out.length-1].dist < route.total-500) out.push({pos:route.pts[route.pts.length-1], dist:route.total});
+  return out;
+}
+
+async function fetchWeather(samples){
+  const out=[];
+  for(let i=0;i<samples.length;i+=40){
+    const ch=samples.slice(i,i+40);
+    const lat=ch.map(s=>s.pos[0].toFixed(3)).join(','), lon=ch.map(s=>s.pos[1].toFixed(3)).join(',');
+    const j=await getJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&minutely_15=precipitation&past_minutely_15=4&forecast_minutely_15=24&timeformat=unixtime&timezone=GMT`);
+    (Array.isArray(j)?j:[j]).forEach(o=>out.push({times:o.minutely_15.time, mm:o.minutely_15.precipitation.map(v=>v==null?0:v)}));
+  }
+  return out;
+}
+
+function nearest(route, p, from){
+  const scan=(lo,hi)=>{ let b=lo, bd=Infinity; for(let i=lo;i<=hi;i++){ const d=hav(route.pts[i],p); if(d<bd){bd=d;b=i;} } return [b,bd]; };
+  const w=scan(Math.max(0,from-10), Math.min(route.pts.length-1, from+500));
+  return w[1]<=1000 ? w : scan(0, route.pts.length-1);
+}
+
+function analyze(samples, weather, progress, speed, nowSec){
+  const out=[];
+  samples.forEach((s,i)=>{
+    if(s.dist < progress-500) return;
+    const w=weather[i]; if(!w||!w.times.length) return;
+    const d=Math.max(0,s.dist-progress), eta=nowSec+d/speed;
+    let slot=w.times.findIndex(t=>t>=eta); if(slot<0) slot=w.times.length-1;
+    out.push({index:i, dist:d, etaMin:d/speed/60, level:lvl(w.mm[slot])});
+  });
+  return out;
+}
+
+function patchesOf(list){
+  const res=[]; let cur=[];
+  for(const a of list){ if(a.level>0) cur.push(a); else if(cur.length){res.push(cur);cur=[];} }
+  if(cur.length) res.push(cur);
+  return res;
+}
+const key = s => s.pos[0].toFixed(2)+','+s.pos[1].toFixed(2);
+function describe(p, stepKm){
+  const lv=Math.max(...p.map(a=>a.level)), eta=Math.round(p[0].etaMin);
+  const when = eta<=0 ? 'now, at your location' : `in ~${eta} min`;
+  const km=p[0].dist/1000, len=(p[p.length-1].dist-p[0].dist)/1000+stepKm;
+  return `${LBL[lv]} ${when} · ${km.toFixed(0)} km ahead · ~${len.toFixed(0)} km long`;
+}
+
+// ---------- alerts
+function beep(){
+  try{
+    if(!audioCtx) audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    audioCtx.resume();
+    [0,0.25].forEach(t=>{
+      const o=audioCtx.createOscillator(), g=audioCtx.createGain();
+      o.frequency.value=880; o.connect(g); g.connect(audioCtx.destination);
+      g.gain.setValueAtTime(0.3,audioCtx.currentTime+t); g.gain.exponentialRampToValueAtTime(0.001,audioCtx.currentTime+t+0.2);
+      o.start(audioCtx.currentTime+t); o.stop(audioCtx.currentTime+t+0.2);
+    });
+  }catch(e){}
+}
+function alertUser(title, text){
+  const b=$('banner'); b.style.display='block'; b.textContent='🌧️ '+title+' — '+text;
+  beep();
+  try{ navigator.vibrate && navigator.vibrate([300,150,300]); }catch(e){}
+  try{ speechSynthesis.speak(new SpeechSynthesisUtterance(title)); }catch(e){}
+  try{ if('Notification' in window && Notification.permission==='granted') new Notification(title,{body:text}); }catch(e){}
+}
+$('test').onclick = () => { unlockAudio(); alertUser('Rain ahead in ~5 min','This is a test alert'); };
+function unlockAudio(){
+  try{ audioCtx=audioCtx||new (window.AudioContext||window.webkitAudioContext)(); audioCtx.resume(); }catch(e){}
+  try{ speechSynthesis.speak(new SpeechSynthesisUtterance('')); }catch(e){}
+}
+
+async function keepAwake(){
+  try{ if('wakeLock' in navigator) wakeLock=await navigator.wakeLock.request('screen'); }catch(e){}
+}
+document.addEventListener('visibilitychange',()=>{ if(run && document.visibilityState==='visible') keepAwake(); });
+
+// ---------- trip
+function setStatus(s){ $('status').textContent=s; }
+
+async function start(){
+  const q=$('dest').value.trim(); if(!q) return;
+  unlockAudio();
+  if('Notification' in window && Notification.permission==='default') Notification.requestPermission();
+  $('go').disabled=true; $('banner').style.display='none';
+  setStatus('Finding destination…');
+  try{
+    const dest=await geocode(q);
+    if(!dest){ setStatus('Couldn’t find “'+q+'”. Try a town name or paste lat,lon.'); $('go').disabled=false; return; }
+    setStatus('Waiting for GPS…');
+    watchId=navigator.geolocation.watchPosition(
+      p=>lastPos=p,
+      e=>setStatus('Location error: '+e.message),
+      {enableHighAccuracy:true, maximumAge:5000, timeout:30000});
+    const first=await new Promise((res,rej)=>{
+      let n=0; const t=setInterval(()=>{ if(lastPos){clearInterval(t);res(lastPos);} else if(++n>90){clearInterval(t);rej(new Error('No GPS fix. Allow location access.'));} },1000);
+    });
+    const route=await getRoute([first.coords.latitude,first.coords.longitude],[dest.lat,dest.lon]);
+    run={dest, route, samples:makeSamples(route), weather:[], weatherAt:0, lastIdx:0, speed:route.total/route.dur, lead:+$('lead').value, notified:new Set(), busy:false};
+    await keepAwake();
+    $('go').textContent='Stop'; $('go').className='sec'; $('go').disabled=false;
+    $('routeCard').style.display='block';
+    tick(); timer=setInterval(tick,LOOP_MS);
+  }catch(e){ setStatus('Error: '+e.message); stop(true); }
+}
+
+function stop(keepMsg){
+  clearInterval(timer); timer=null;
+  if(watchId!=null) navigator.geolocation.clearWatch(watchId); watchId=null;
+  try{ wakeLock&&wakeLock.release(); }catch(e){} wakeLock=null;
+  run=null; lastPos=null;
+  $('go').textContent='Start trip'; $('go').className=''; $('go').disabled=false;
+  if(!keepMsg) setStatus('Stopped');
+}
+
+async function tick(){
+  if(!run||run.busy||!lastPos) return;
+  run.busy=true;
+  try{
+    const r=run, c=lastPos.coords, here=[c.latitude,c.longitude];
+    let [idx,off]=nearest(r.route,here,r.lastIdx);
+    if(off>1000){
+      setStatus('Off route – recalculating…');
+      r.route=await getRoute(here,[r.dest.lat,r.dest.lon]);
+      r.samples=makeSamples(r.route); r.weather=[]; r.lastIdx=0; r.busy=false; return tick();
+    }
+    r.lastIdx=idx;
+    const progress=r.route.cum[idx], remaining=r.route.total-progress;
+    if(remaining<300){ setStatus('Arrived at '+r.dest.name); stop(true); return; }
+
+    if(c.speed!=null && c.speed>3) r.speed=0.7*r.speed+0.3*c.speed;
+    const sp=Math.max(r.speed,5);
+
+    const now=Date.now();
+    if(!r.weather.length || now-r.weatherAt>WEATHER_REFRESH_MS){ r.weather=await fetchWeather(r.samples); r.weatherAt=now; }
+
+    const ahead=analyze(r.samples,r.weather,progress,sp,now/1000);
+    const patches=patchesOf(ahead);
+    const stepKm=r.samples.length>1 ? (r.samples[1].dist-r.samples[0].dist)/1000 : 3;
+
+    for(const p of patches){
+      const keys=p.map(a=>key(r.samples[a.index]));
+      if(p[0].etaMin<=r.lead && !keys.some(k=>r.notified.has(k))){
+        keys.forEach(k=>r.notified.add(k));
+        const eta=Math.round(p[0].etaMin);
+        alertUser(eta<=0 ? 'Rain at your location' : `Rain ahead in ~${eta} min`, describe(p,stepKm));
+      }
+    }
+
+    const lines=patches.map(p=>describe(p,stepKm));
+    setStatus(lines[0] || 'No rain expected on route');
+    $('info').textContent=`To ${r.dest.name} · ${(remaining/1000).toFixed(0)} km left · ~${Math.round(remaining/sp/60)} min · updated ${new Date().toLocaleTimeString()}`;
+    $('strip').innerHTML=ahead.map(a=>`<div style="background:${COL[a.level]}"></div>`).join('');
+    $('patches').innerHTML=lines.length ? lines.map(l=>`<li>${l}</li>`).join('') : '<li>None</li>';
+  }catch(e){
+    setStatus('Network issue, retrying… ('+e.message+')');
+  }finally{ if(run) run.busy=false; }
+}
+
+$('go').onclick = () => run ? stop() : start();
+</script>
+</body>
+</html>
